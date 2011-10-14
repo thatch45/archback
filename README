@@ -1,0 +1,33 @@
+It is a bash script that can run on anything with bash, date, fmt, awk, sed,
+wget, etc.  ArchLinux is not required.  It will probably even work on
+Windows under Cygwin
+
+Run "archback -g" to generate the default config file
+
+As root, run "archback -g /etc/archback.conf" to generate the configuration file in /etc
+
+In /etc/archback.conf change:
+
+ARCHBACK_ARCHS to 'x86_64' (to disregard i686 packages)
+
+ARCHBACK_MIRROR to a faster mirror (see https://www.archlinux.de/?page=MirrorStatus)
+… the default canonical mirror is throttled to 50 KBPS
+
+ARCHBACK_REPOS to just the repos you want (e.g. core and extra)
+
+ARCHBACK_TZ to UTC (otherwise the date will be calculated from your account's TZ …
+MST7MST or PST8PDT depending on where the server is running)
+
+Run "archback -h" to see the man/help page
+
+Run "archback" to create a snapshot.  By default it will be written to
+/var/lib/archback/snapshots/YYYY/MM/DD.
+
+If you want a snapshot to be the "latest" snapshot, add "-l" to the command line,
+e.g. "archback -l".  This creates a link from /var/lib/archback/snapshots/latest
+to the new snapshot.
+
+If you want to create a test snapshot, specify a snapshot name, e.g.
+"archback mytest".  You can include strftime format specifiers in the name, e.g.
+"archback mytest/%Y/%m/%d" to create your own test snapshot hierarchy
+
