@@ -1,0 +1,362 @@
+#!/bin/bash
+
+# Add an ArchLinux snapshot to a local multi-snapshot repository.
+#
+# Author: Erik Nolte <erik_nolte@acm.org>
+
+trap 'echo; echo "interrupted"; exit 1' 2 3
+
+CONFIG="ARCHBACK_ARCHS|Snapshot the specified architectures.  ('i686' and/or 'x86_64')|'i686 x86_64'
+ARCHBACK_DIR|Store snapshots in this directory.|'/var/lib/archback'
+ARCHBACK_FORCE|Force update an existing snapshot (yes or no)|'no'
+ARCHBACK_LATEST|Symbolic link that points to latest snapshot|'\$ARCHBACK_DIR/snapshots/latest'
+ARCHBACK_LAYOUT|Snapshot directory layout.|'\$repo/os/\$arch'
+ARCHBACK_MIRROR|ArchLinux pacman mirror URL.  The default mirror (ftp.archlinux.org) is throttled to 50 KBPS.  Consider finding a faster mirror.|'ftp://ftp.archlinux.org/\$repo/os/\$arch'
+ARCHBACK_RC|The archback configuration file.|'/etc/archback.conf'
+ARCHBACK_REPOS|ArchLinux repositories to snapshot.|'core extra community multilib'
+ARCHBACK_SNAPSHOT|Snapshot name (may contain strftime %vars).|'%Y/%m/%d'
+ARCHBACK_TZ|The timezone used to compute the date, e.g. UTC or MST7MDT.  Leave blank to use your account's timezone.  Consider using UTC if your mirror is used by people in more that one timezone.|''
+ARCHBACK_VERBOSITY|Output verbosity.  Can be quiet or normal.|'normal'"
+
+ERROR=0
+WARNING=1
+NORMAL=2
+VERBOSITY="$NORMAL"
+
+# Print the command line usage and environment variables
+
+Usage()
+{
+    cat <<EOF
+usage: $(basename $0) [-a archs][-m mirror][-r repos][-fhlqx] [snapshot]
+       $(basename $0) -g [path]
+
+       Create a snapshot of the remote ArchLinux repository.
+
+       -a archs   = snapshot archs (e.g. i686, x86_64)
+       -h         = display help (this message)
+       -f         = force update an existing snapshot
+       -g         = generate default config file
+       -l         = this snapshot is the 'latest' snapshot
+       -m mirror  = mirror url
+       -r repos   = snapshot repos (e.g. core, extra, ...)
+       -q         = quiet (just error messages)
+       -x         = trace execution
+
+       snapshot = snapshot name (e.g. '%Y/%m/%d' or 'test')
+
+       Environment and config variables:
+EOF
+
+    local old_IFS="$IFS"
+    local var_width=$(awk -F'|' '{ max = max>length($1) ? max : length($1) }
+                                 END { print max }' <<< "$CONFIG")
+    local fmt=$(printf "%12s%%-${var_width}s = " "")
+    local next_prefix=$(printf "$fmt" "" | sed 's/./ /g')
+    local desc_width=$(( 80 - ${#next_prefix} ))
+    local line
+    local name
+    local desc
+    local defval
+
+    IFS='|'
+    while read name desc defval
+    do
+        local prefix=$(printf "$fmt" "$name")
+        echo "$desc  Default=$defval" |
+        fmt -w $desc_width |
+        while read line
+        do
+            echo "$prefix$line"
+            prefix="$next_prefix"
+        done
+    done <<< "$CONFIG"
+    IFS="$old_IFS"
+}
+
+# Generate the archback.conf file.
+# Usage: GenerateConfigFile <dest-path>
+
+GenerateConfigFile()
+{
+    if [ $# -gt 0 ]
+    then
+        exec > "$1"
+    fi
+    cat <<EOF
+#!/bin/bash
+
+#
+# The archback configuration file.
+#
+EOF
+    local old_IFS="$IFS"
+    local name
+    local desc
+    local defval
+    IFS='|'
+    while read name desc defval
+    do
+        echo
+        echo "$desc" |
+        fmt -w 75 |
+        sed 's/^/# /'
+        echo "#$name=$defval"
+    done <<< "$CONFIG"
+    IFS="$old_IFS"
+}
+
+# Print a status message and exit if -f is specified.
+# Usage: Status [-efn] <message>
+#   -e = prefix message with "error: " and send to stderr
+#   -f = fatal (exit 1); implies -e
+#   -n = suppress newline (used for "msg ... " progress messages)
+#   -e = prefix message with "warning: " and send to stderr
+
+Status()
+{
+    local fmt="%s\n"
+    local level="$NORMAL"
+    local fatal="no"
+    OPTIND=0
+    while getopts 'efnw' opt
+    do
+        case "$opt" in
+        e) fmt="error: %s\n"; level="$ERROR" ;;
+        f) fmt="error: %s\n"; level="$ERROR"; fatal="yes" ;;
+        n) fmt="%s" ;;
+        w) fmt="warning: %s\n" level="$WARNING" ;;
+        *) echo "Status: bad option: -$opt" >&2; exit 1 ;;
+        esac
+    done
+    shift $(($OPTIND - 1))
+
+    if [ "$VERBOSITY" -ge "$level" ]
+    then
+        if [ "$level" -le "$WARNING" ]
+        then
+            printf "$fmt" "$*" >&2
+        else
+            printf "$fmt" "$*"
+        fi
+    fi
+    [ "$fatal" = "yes" ] && exit 1
+}
+
+# Configure the ARCHBACK_* variables from (in increaing priority):
+#   1. Built in defaults
+#   2. The archback.conf config file
+#   3. ARCHBACK_* environment variables
+#   4. Command line options
+
+Configure()
+{
+    local action="snapshot"
+    ARCHBACK_WGET="wget -q"
+    ARCHBACK_LINK_LATEST="no"
+
+    # Set values from command line
+    while getopts 'a:fghlm:r:qvx' opt "$@"
+    do
+        case "$opt" in
+        a) export ARCHBACK_ARCHS="$OPTARG" ;;
+        f) export ARCHBACK_FORCE="yes" ;;
+        g) action="genconfig" ;;
+        h) Usage; exit 0 ;;
+        l) export ARCHBACK_LINK_LATEST="yes" ;;
+        m) export ARCHBACK_MIRROR="$OPTARG" ;;
+        r) export ARCHBACK_REPOS="$OPTARG" ;;
+        q) export ARCHBACK_VERBOSITY="quiet" ;;
+        x) export ARCHBACK_VERBOSITY="normal"
+           export ARCHBACK_WGET="wget -v"
+           set -x ;;
+        *) exit 1;;
+        esac
+    done
+    shift $(( $OPTIND - 1 ))
+
+    local env_values=$(env | grep ARCHBACK_ | sed 's/\$/\\$/g')
+    local rcfile="$ARCHBACK_RC"
+
+    # Set values to builtin defaults
+    while read line
+    do
+        eval export "$(echo "$line" | awk -F'|' '{ printf("%s=%s\n", $1, $3) }')"
+    done <<< "$CONFIG"
+
+    # Set values in the rc config file
+    [ -n "$rcfile" ] && ARCHBACK_RC="$rcfile"
+    if [ -f "$ARCHBACK_RC" ]
+    then
+        set -ae
+        . "$ARCHBACK_RC"
+        set +e
+    fi
+
+    # Restore cmdline/env values
+    while read line
+    do
+        eval "$line"
+    done <<< "$env_values"
+
+    if [ "$action" = "genconfig" ]
+    then
+        GenerateConfigFile "$@"
+        exit 0
+    elif [ $# -ge 1 ]
+    then
+        ARCHBACK_SNAPSHOT="$1"
+    fi
+
+    [ -n "$ARCHBACK_TZ" ] && export TZ="$ARCHBACK_TZ"
+
+    case "$ARCHBACK_VERBOSITY" in
+    quiet)     VERBOSITY="$ERROR" ;;
+    normal|"") VERBOSITY="$NORMAL" ;;
+    *) Status -f "bad value for ARCHBACK_VERBOSITY: $ARCHBACK_VERBOSITY" ;;
+    esac
+}
+
+# Download a file at URL to a dest file.
+# Usage: Download <src-url> <dest-file>
+
+Download()
+{
+    local src_url="$1"
+    local dest_file="$2"
+    local filename="$(basename "$src_url")"
+    local dest_dir=$(dirname "$dest_file")
+    local tmp_file="$dest_dir/.$(basename "$dest_file").download"
+
+    Status -n "        download $filename ... "
+    mkdir -p "$dest_dir"
+    $ARCHBACK_WGET -O "$tmp_file" "$src_url"
+    if [ -s "$tmp_file" ]
+    then
+        Status "downloaded"
+        mv "$tmp_file" "$dest_file"
+    else
+        Status "non-existent"
+        rm "$tmp_file"
+    fi
+}
+
+# Extract the package filename from the repo's db file.
+# Usage: ListPackageFiles <db-path>
+
+ListPackageFiles()
+{
+    local pkg_db="$1"
+    local tmp_dir="$(dirname "$pkg_db")/.list_files"
+    local path
+
+    rm -rf "$tmp_dir" 2>/dev/null
+    mkdir -p "$tmp_dir"
+    (
+        cd "$tmp_dir"
+        tar -xf "$pkg_db"
+        find . -name desc |
+        while read path
+        do
+            awk '/%FILENAME%/ { found=1; next }
+                 found { print $0; exit }' "$path"
+        done |
+        sort
+    )
+    rm -rf "$tmp_dir"
+}
+
+# Synchronize a local directory with a remote repo.
+# Usage: SyncRepo <repo-name> <repo-url> <local-dir>
+
+SyncRepo()
+{
+    local repo="$1"
+    local repo_url="$2"
+    local repo_dir="$3"
+    local db_file="$repo_dir/$repo.db"
+    local pool_dir="$ARCHBACK_DIR/pool"
+    local filename
+
+    Status "    sync $repo/$arch repo:"
+    Download "$repo_url/$repo.db" "$db_file"
+    Download "$repo_url/$repo.files" "$repo_dir/$repo.files"
+
+    ListPackageFiles "$db_file" |
+    while read filename
+    do
+        if [ ! -f "$pool_dir/$filename" ]
+        then
+            Download "$repo_url/$filename.sig" "$pool_dir/$filename.sig"
+            Download "$repo_url/$filename"     "$pool_dir/$filename"
+        fi
+
+        if [ ! -f "$pool_dir/$filename" ]
+        then
+            Status -e "$db_file refers to non-existent $filename"
+        elif [ ! -f "$repo_dir/$filename" ]
+        then
+            Status "        link $filename"
+            ln "$pool_dir/$filename" "$repo_dir/$filename"
+        else
+            Status "        already linked $filename"
+        fi
+    done
+}
+
+# Create a repo snapshot for this instant in time.
+# Usage: MakeSnapshot <snapshot-name>
+
+MakeSnapshot()
+{
+    local snapshot="$1"
+    local snapshot_dir="$ARCHBACK_DIR/snapshots/$snapshot"
+    local tmp_dir="$(dirname "$snapshot_dir")/.$(basename "$snapshot_dir").update"
+
+    if [ -e "$snapshot_dir" ]
+    then
+        if [ "$ARCHBACK_FORCE" = "yes" ]
+        then
+            if [ -d "$snapshot_dir" ]
+            then
+                rm -rf "$tmp_dir" 2>/dev/null
+                mv "$snapshot_dir" "$tmp_dir"
+            else
+                Status -f "is not a directory: $snapshot_dir"
+            fi
+        else
+            Status -f "snapshot '$snapshot' already exists"
+        fi
+    fi
+    if [[ "$ARCHBACK_MIRROR" == ftp://ftp.archlinux.org* ]]
+    then
+        Status -w "ftp.archlinux.org is throttled to 50 KBPS"
+    fi
+    Status "create '$snapshot' snapshot:"
+    mkdir -p "$tmp_dir"
+    echo "$snapshot" > "$tmp_dir/snapshot"
+
+    for repo in $ARCHBACK_REPOS
+    do
+        for arch in $ARCHBACK_ARCHS
+        do
+            url=$(eval echo "$ARCHBACK_MIRROR")
+            repo_dir=$(eval echo "$tmp_dir/$ARCHBACK_LAYOUT")
+            SyncRepo "$repo" "$url" "$repo_dir"
+            Status ""
+        done
+    done
+
+    mv "$tmp_dir" "$snapshot_dir"
+
+    if [ "$ARCHBACK_LINK_LATEST" = "yes" ]
+    then
+        local symlink="$(eval echo "$ARCHBACK_LATEST")"
+        Status "link latest to $snapshot_dir"
+        rm -f "$symlink" 2>/dev/null
+        ln -s "$snapshot_dir" "$symlink"
+    fi
+}
+
+Configure "$@"
+MakeSnapshot $(date +"$ARCHBACK_SNAPSHOT")
