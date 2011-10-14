@@ -1,0 +1,24 @@
+# Maintainer: Thomas S Hatch <thatch45@gmail.com>
+
+pkgname=archback
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Snapshot remote ArchLinux repositories for later rollback"
+arch=(any)
+url="https://github.com/thatch45/archback"
+license=("APACHE")
+depends=('bash' 'coreutils')
+backup=('etc/archback.conf')
+makedepends=()
+optdepends=()
+options=()
+md5sums=()
+
+build()
+{
+    mkdir -p "$pkgdir/usr/sbin" \
+             "$pkgdir/etc"
+    cp "$startdir/../../archback" "$pkgdir/usr/sbin"
+    chmod 755 "$pkgdir/usr/sbin/archback"
+    "$pkgdir/usr/sbin/archback" -g "$pkgdir/etc/archback.conf"
+}
